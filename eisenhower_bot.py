@@ -1,0 +1,693 @@
+#!/usr/bin/env python3
+"""
+Telegram Bot - Eisenhower Task Planner
+Matrix-based task manager with reminders and motivation
+"""
+
+import logging
+import sqlite3
+from datetime import datetime, timedelta
+import requests
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from io import BytesIO
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+
+# ===== КОНФИГУРАЦИЯ =====
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+DB_PATH = "eisenhower_planner.db"
+QUOTE_API_URL = "https://zenquotes.io/api/random"
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ===== ОПИСАНИЯ КАТЕГОРИЙ =====
+CATEGORY_INFO = {
+    'important_urgent': {
+        'name': '🚨 Важные и срочные',
+        'description': 'Критические задачи, требующие немедленного внимания. Дела, которые нельзя отложить.',
+        'examples': ['• Срочный дедлайн по проекту\n• Критическая проблема со здоровьем\n• Автомобиль сломался']
+    },
+    'important_not_urgent': {
+        'name': '🎯 Важные, но не срочные',
+        'description': 'Стратегические задачи для долгосрочного развития. Самые продуктивные задачи!',
+        'examples': ['• Планирование целей\n• Обучение новым навыкам\n• Регулярные тренировки']
+    },
+    'not_important_urgent': {
+        'name': '📅 Срочные, но не важные',
+        'description': 'Отвлекающие факторы, которые создают иллюзию занятости. Часто можно делегировать.',
+        'examples': ['• Внезапные звонки\n• Некоторые встречи\n• Рутинные поручения']
+    },
+    'not_important_not_urgent': {
+        'name': '⏳ Не срочные и не важные',
+        'description': 'Поглотители времени. Минимизируйте эти занятия.',
+        'examples': ['• Социальные сети\n• Бесцельный серфинг в интернете\n• Чрезмерный отдых']
+    }
+}
+
+# ===== ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ =====
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            reminder_time TEXT DEFAULT '09:00',
+            registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tasks (
+            task_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            task_text TEXT NOT NULL,
+            category TEXT NOT NULL CHECK(category IN ('important_urgent', 'important_not_urgent', 'not_important_urgent', 'not_important_not_urgent')),
+            deadline TIMESTAMP,
+            reminder_hours_before INTEGER DEFAULT 24,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            is_completed BOOLEAN DEFAULT FALSE,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS quotes (
+            quote_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            quote_text TEXT NOT NULL,
+            author TEXT,
+            added_date DATE DEFAULT CURRENT_DATE
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+# ===== РАБОТА С ЦИТАТАМИ =====
+def get_daily_quote():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT quote_text, author FROM quotes WHERE added_date = DATE('now')")
+        result = cursor.fetchone()
+        
+        if result:
+            conn.close()
+            return f"\"{result[0]}\"\n— {result[1]}"
+        
+        response = requests.get(QUOTE_API_URL, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            quote_text = data[0]['q']
+            author = data[0]['a']
+            
+            cursor.execute(
+                "INSERT INTO quotes (quote_text, author) VALUES (?, ?)",
+                (quote_text, author)
+            )
+            conn.commit()
+            conn.close()
+            
+            return f"\"{quote_text}\"\n— {author}"
+    
+    except Exception as e:
+        logger.error(f"Error getting quote: {e}")
+    
+    return "«Самое время сделать что-то важное!»\n— Ваш Планировщик"
+
+# ===== ВИЗУАЛИЗАЦИЯ МАТРИЦЫ =====
+def create_eisenhower_matrix(user_id):
+    """Создает визуальное представление матрицы Эйзенхауэра с задачами пользователя"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT category, task_text, is_completed 
+        FROM tasks 
+        WHERE user_id = ? AND is_completed = FALSE
+    ''', (user_id,))
+    
+    tasks = cursor.fetchall()
+    conn.close()
+    
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    ax.add_patch(patches.Rectangle((0, 0.5), 0.5, 0.5, fill=True, color='#ff6b6b', alpha=0.3))
+    ax.add_patch(patches.Rectangle((0.5, 0.5), 0.5, 0.5, fill=True, color='#51cf66', alpha=0.3))
+    ax.add_patch(patches.Rectangle((0, 0), 0.5, 0.5, fill=True, color='#ffd43b', alpha=0.3))
+    ax.add_patch(patches.Rectangle((0.5, 0), 0.5, 0.5, fill=True, color='#868e96', alpha=0.3))
+    
+    ax.text(0.25, 0.75, '🚨 ВАЖНЫЕ\nСРОЧНЫЕ', ha='center', va='center', fontsize=14, weight='bold', color='#c92a2a')
+    ax.text(0.75, 0.75, '🎯 ВАЖНЫЕ\nНЕСРОЧНЫЕ', ha='center', va='center', fontsize=14, weight='bold', color='#2b8a3e')
+    ax.text(0.25, 0.25, '📅 НЕВАЖНЫЕ\nСРОЧНЫЕ', ha='center', va='center', fontsize=14, weight='bold', color='#e67700')
+    ax.text(0.75, 0.25, '⏳ НЕВАЖНЫЕ\nНЕСРОЧНЫЕ', ha='center', va='center', fontsize=14, weight='bold', color='#495057')
+    
+    y_positions = {
+        'important_urgent': [0.65, 0.60, 0.55, 0.50],
+        'important_not_urgent': [0.65, 0.60, 0.55, 0.50],
+        'not_important_urgent': [0.40, 0.35, 0.30, 0.25],
+        'not_important_not_urgent': [0.40, 0.35, 0.30, 0.25]
+    }
+    
+    task_counters = {category: 0 for category in CATEGORY_INFO.keys()}
+    
+    for category, task_text, is_completed in tasks:
+        if task_counters[category] < 4:
+            if category in ['important_urgent', 'not_important_urgent']:
+                x = 0.1 if task_counters[category] % 2 == 0 else 0.3
+            else:
+                x = 0.6 if task_counters[category] % 2 == 0 else 0.8
+            
+            y = y_positions[category][task_counters[category] // 2]
+            
+            display_text = task_text[:20] + '...' if len(task_text) > 20 else task_text
+            ax.text(x, y, f'• {display_text}', fontsize=8, ha='left', va='center',
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8))
+            
+            task_counters[category] += 1
+    
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis('off')
+    
+    buf = BytesIO()
+    plt.savefig(buf, format='png', dpi=80, bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    
+    return buf
+
+# ===== КОМАНДЫ БОТА =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        "INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
+        (user.id, user.username, user.first_name)
+    )
+    conn.commit()
+    conn.close()
+    
+    quote = get_daily_quote()
+    welcome_text = f"""
+Привет, {user.first_name}! 👋
+
+Я твой личный планировщик по *Матрице Эйзенхауэра* - мощному инструменту для управления приоритетами.
+
+*Основные команды:*
+/add - Добавить задачу с дедлайном
+/tasks - Показать мои задачи  
+/matrix - Визуальная матрица задач
+/complete - Отметить выполнение
+/stats - Статистика продуктивности
+/reminders - Настроить напоминания
+/quote - Мотивационная цитата
+
+*Сегодняшняя цитата:*
+{quote}
+"""
+    
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+
+async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "📊 *Матрица Эйзенхауэра - Объяснение категорий:*\n\n"
+    
+    for category_key, info in CATEGORY_INFO.items():
+        text += f"{info['name']}:\n"
+        text += f"{info['description']}\n"
+        text += f"*Примеры:*\n{info['examples']}\n\n"
+    
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("🚨 Важные и срочные", callback_data="category_important_urgent")],
+        [InlineKeyboardButton("🎯 Важные, но не срочные", callback_data="category_important_not_urgent")],
+        [InlineKeyboardButton("📅 Срочные, но не важные", callback_data="category_not_important_urgent")],
+        [InlineKeyboardButton("⏳ Не срочные и не важные", callback_data="category_not_important_not_urgent")],
+        [InlineKeyboardButton("❓ Объяснение категорий", callback_data="explain_categories")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "Выбери категорию для новой задачи:",
+        reply_markup=reply_markup
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    if query.data.startswith("category_"):
+        category = query.data.replace("category_", "")
+        context.user_data['awaiting_task'] = category
+        context.user_data['task_stage'] = 'text'
+        
+        await query.edit_message_text(
+            f"Выбрана категория: *{CATEGORY_INFO[category]['name']}*\n\n"
+            f"*Описание:* {CATEGORY_INFO[category]['description']}\n\n"
+            "Теперь напиши текст задачи:",
+            parse_mode='Markdown'
+        )
+    
+    elif query.data == "explain_categories":
+        await show_categories_info(query)
+    
+    elif query.data.startswith("complete_"):
+        task_id = int(query.data.replace("complete_", ""))
+        await complete_task(query, task_id)
+    
+    elif query.data.startswith("reminder_"):
+        time_str = query.data.replace("reminder_", "")
+        await set_reminder_time(query, time_str)
+
+async def show_categories_info(query):
+    text = "📊 *Объяснение категорий матрицы:*\n\n"
+    
+    for category_key, info in CATEGORY_INFO.items():
+        text += f"{info['name']}:\n"
+        text += f"{info['description']}\n"
+        text += f"*Примеры:*\n{info['examples']}\n\n"
+    
+    keyboard = [[InlineKeyboardButton("« Назад к добавлению задачи", callback_data="back_to_categories")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+
+async def complete_task(query, task_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        "UPDATE tasks SET is_completed = TRUE, completed_at = CURRENT_TIMESTAMP WHERE task_id = ?",
+        (task_id,)
+    )
+    conn.commit()
+    
+    cursor.execute("SELECT task_text FROM tasks WHERE task_id = ?", (task_id,))
+    task_text = cursor.fetchone()[0]
+    conn.close()
+    
+    await query.edit_message_text(
+        f"✅ *Задача выполнена!*\n\n\"{task_text}\"\n\n"
+        f"Отличная работа! Продолжайте в том же духе! 💪",
+        parse_mode='Markdown'
+    )
+
+async def set_reminder_time(query, time_str):
+    user_id = query.from_user.id
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        "UPDATE users SET reminder_time = ? WHERE user_id = ?",
+        (time_str, user_id)
+    )
+    conn.commit()
+    conn.close()
+    
+    await query.edit_message_text(
+        f"✅ Время ежедневных напоминаний установлено на *{time_str}*\n\n"
+        f"Вы будете получать уведомления о своих задачах каждый день в это время.",
+        parse_mode='Markdown'
+    )
+
+async def handle_task_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'task_stage' not in context.user_data:
+        return
+    
+    user_id = update.effective_user.id
+    task_stage = context.user_data['task_stage']
+    
+    if task_stage == 'text':
+        context.user_data['task_text'] = update.message.text
+        context.user_data['task_stage'] = 'deadline'
+        
+        keyboard = [
+            [InlineKeyboardButton("⏰ Сегодня", callback_data="deadline_today")],
+            [InlineKeyboardButton("📅 Завтра", callback_data="deadline_tomorrow")],
+            [InlineKeyboardButton("🗓 Через 3 дня", callback_data="deadline_3days")],
+            [InlineKeyboardButton("📆 Через неделю", callback_data="deadline_week")],
+            [InlineKeyboardButton("⏳ Без дедлайна", callback_data="deadline_none")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "📅 Выбери дедлайн для задачи:",
+            reply_markup=reply_markup
+        )
+    
+    elif task_stage == 'deadline_custom':
+        try:
+            deadline_date = datetime.strptime(update.message.text, '%d.%m.%Y %H:%M')
+            await save_task_with_deadline(update, context, deadline_date)
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Неверный формат даты. Используй: ДД.ММ.ГГГГ ЧЧ:ММ\nНапример: 25.12.2024 14:30"
+            )
+
+async def handle_deadline_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "deadline_custom":
+        context.user_data['task_stage'] = 'deadline_custom'
+        await query.edit_message_text(
+            "📅 Введи дату и время в формате:\n*ДД.ММ.ГГГГ ЧЧ:ММ*\n\nНапример: 25.12.2024 14:30",
+            parse_mode='Markdown'
+        )
+        return
+    
+    deadline_map = {
+        'deadline_today': datetime.now() + timedelta(hours=2),
+        'deadline_tomorrow': datetime.now() + timedelta(days=1),
+        'deadline_3days': datetime.now() + timedelta(days=3),
+        'deadline_week': datetime.now() + timedelta(days=7),
+        'deadline_none': None
+    }
+    
+    deadline = deadline_map.get(query.data)
+    await save_task_with_deadline(query, context, deadline)
+
+async def save_task_with_deadline(update, context, deadline):
+    user_id = update.effective_user.id if hasattr(update, 'effective_user') else update.from_user.id
+    task_text = context.user_data['task_text']
+    category = context.user_data['awaiting_task']
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        "INSERT INTO tasks (user_id, task_text, category, deadline) VALUES (?, ?, ?, ?)",
+        (user_id, task_text, category, deadline)
+    )
+    task_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    
+    context.user_data.clear()
+    
+    deadline_text = deadline.strftime("%d.%m.%Y %H:%M") if deadline else "не установлен"
+    
+    response_text = (
+        f"✅ *Задача добавлена!*\n\n"
+        f"*Задача:* {task_text}\n"
+        f"*Категория:* {CATEGORY_INFO[category]['name']}\n"
+        f"*Дедлайн:* {deadline_text}\n\n"
+        f"Используй /tasks чтобы посмотреть все задачи."
+    )
+    
+    if hasattr(update, 'message'):
+        await update.message.reply_text(response_text, parse_mode='Markdown')
+    else:
+        await update.edit_message_text(response_text, parse_mode='Markdown')
+
+async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT task_id, task_text, category, deadline, is_completed 
+        FROM tasks 
+        WHERE user_id = ? AND is_completed = FALSE
+        ORDER BY 
+            CASE category
+                WHEN 'important_urgent' THEN 1
+                WHEN 'important_not_urgent' THEN 2
+                WHEN 'not_important_urgent' THEN 3
+                WHEN 'not_important_not_urgent' THEN 4
+            END,
+            deadline ASC
+    ''', (user_id,))
+    
+    tasks = cursor.fetchall()
+    conn.close()
+    
+    if not tasks:
+        await update.message.reply_text(
+            "🎉 У тебя пока нет активных задач!\n\n"
+            "Используй /add чтобы добавить первую задачу."
+        )
+        return
+    
+    tasks_by_category = {}
+    for task in tasks:
+        task_id, task_text, category, deadline, is_completed = task
+        if category not in tasks_by_category:
+            tasks_by_category[category] = []
+        tasks_by_category[category].append((task_id, task_text, deadline))
+    
+    message = "📋 *Твои задачи по матрице Эйзенхауэра:*\n\n"
+    
+    for category in CATEGORY_INFO.keys():
+        if category in tasks_by_category:
+            message += f"*{CATEGORY_INFO[category]['name']}:*\n"
+            for task_id, task_text, deadline in tasks_by_category[category]:
+                deadline_text = deadline.strftime("%d.%m.%Y %H:%M") if deadline else "нет дедлайна"
+                message += f"• {task_text}\n  ⏰ {deadline_text}\n"
+            message += "\n"
+    
+    message += "\nИспользуй /complete чтобы отметить задачи выполненными."
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def show_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    matrix_image = create_eisenhower_matrix(user_id)
+    
+    caption = (
+        "📊 *Ваша матрица Эйзенхауэра*\n\n"
+        "• 🚨 **Важные и срочные** - Сделать сразу\n"
+        "• 🎯 **Важные, но не срочные** - Запланировать\n" 
+        "• 📅 **Срочные, но не важные** - Делегировать\n"
+        "• ⏳ **Не срочные и не важные** - Удалить\n"
+    )
+    
+    await update.message.reply_photo(
+        photo=matrix_image,
+        caption=caption,
+        parse_mode='Markdown'
+    )
+
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT 
+            COUNT(*) as total_tasks,
+            SUM(CASE WHEN is_completed THEN 1 ELSE 0 END) as completed_tasks,
+            SUM(CASE WHEN is_completed = 0 THEN 1 ELSE 0 END) as pending_tasks
+        FROM tasks 
+        WHERE user_id = ?
+    ''', (user_id,))
+    
+    total, completed, pending = cursor.fetchone()
+    
+    cursor.execute('''
+        SELECT 
+            category,
+            COUNT(*) as total,
+            SUM(CASE WHEN is_completed THEN 1 ELSE 0 END) as completed
+        FROM tasks 
+        WHERE user_id = ?
+        GROUP BY category
+    ''', (user_id,))
+    
+    category_stats = cursor.fetchall()
+    conn.close()
+    
+    if total == 0:
+        await update.message.reply_text(
+            "📊 У тебя пока нет задач для статистики.\n\n"
+            "Начни добавлять задачи через /add чтобы отслеживать свою продуктивность!"
+        )
+        return
+    
+    completion_rate = (completed / total) * 100 if total > 0 else 0
+    
+    message = f"📊 *Статистика продуктивности*\n\n"
+    message += f"• Всего задач: {total}\n"
+    message += f"• Выполнено: {completed}\n"
+    message += f"• В процессе: {pending}\n"
+    message += f"• Процент выполнения: {completion_rate:.1f}%\n\n"
+    
+    message += "*По категориям:*\n"
+    for category, cat_total, cat_completed in category_stats:
+        cat_completion = (cat_completed / cat_total) * 100 if cat_total > 0 else 0
+        message += f"{CATEGORY_INFO[category]['name']}: {cat_completed}/{cat_total} ({cat_completion:.1f}%)\n"
+    
+    message += f"\n💡 *Рекомендации:*\n"
+    if completion_rate < 50:
+        message += "Старайтесь фокусироваться на завершении задач!"
+    elif completion_rate < 80:
+        message += "Хороший прогресс! Продолжайте в том же духе!"
+    else:
+        message += "Отличные результаты! Вы очень продуктивны!"
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def complete_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT task_id, task_text, category 
+        FROM tasks 
+        WHERE user_id = ? AND is_completed = FALSE
+        ORDER BY 
+            CASE category
+                WHEN 'important_urgent' THEN 1
+                WHEN 'important_not_urgent' THEN 2
+                WHEN 'not_important_urgent' THEN 3
+                WHEN 'not_important_not_urgent' THEN 4
+            END
+        LIMIT 10
+    ''', (user_id,))
+    
+    tasks = cursor.fetchall()
+    conn.close()
+    
+    if not tasks:
+        await update.message.reply_text("🎉 Нет активных задач для отметки!")
+        return
+    
+    keyboard = []
+    for task_id, task_text, category in tasks:
+        display_text = task_text[:30] + '...' if len(task_text) > 30 else task_text
+        button_text = f"{CATEGORY_INFO[category]['name'][:2]} {display_text}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"complete_{task_id}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "✅ Выбери задачу для отметки выполнения:",
+        reply_markup=reply_markup
+    )
+
+async def manage_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("⏰ 07:00 Утро", callback_data="reminder_07:00")],
+        [InlineKeyboardButton("🏃 09:00 Начало дня", callback_data="reminder_09:00")],
+        [InlineKeyboardButton("☕ 12:00 Обед", callback_data="reminder_12:00")],
+        [InlineKeyboardButton("💼 15:00 После обеда", callback_data="reminder_15:00")],
+        [InlineKeyboardButton("🌇 18:00 Вечер", callback_data="reminder_18:00")],
+        [InlineKeyboardButton("🔕 Выключить напоминания", callback_data="reminder_off")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "⏰ *Настройка ежедневных напоминаний*\n\n"
+        "Выбери время для получения ежедневных уведомлений о твоих задачах:",
+        parse_mode='Markdown',
+        reply_markup=reply_markup
+    )
+
+async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    user_id = job.data
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT reminder_time FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    
+    if not result or result[0] == 'off':
+        conn.close()
+        return
+    
+    cursor.execute('''
+        SELECT category, COUNT(*) 
+        FROM tasks 
+        WHERE user_id = ? AND is_completed = FALSE
+        GROUP BY category
+    ''', (user_id,))
+    
+    task_counts = cursor.fetchall()
+    conn.close()
+    
+    if not task_counts:
+        return
+    
+    message = "⏰ *Ежедневное напоминание!*\n\n*Твои текущие задачи:*\n"
+    
+    total_tasks = 0
+    for category, count in task_counts:
+        message += f"{CATEGORY_INFO[category]['name']}: {count} задач\n"
+        total_tasks += count
+    
+    quote = get_daily_quote()
+    message += f"\n*Всего активных задач: {total_tasks}*\n"
+    message += f"\n💡 *Совет:* Начни с важных и срочных задач!\n\n"
+    message += f"*Мотивация на сегодня:*\n{quote}"
+    
+    try:
+        await context.bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error sending reminder to {user_id}: {e}")
+
+# ===== ОСНОВНАЯ ФУНКЦИЯ =====
+def main():
+    init_db()
+    
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("quote", show_quote))
+    application.add_handler(CommandHandler("add", add_task))
+    application.add_handler(CommandHandler("tasks", show_tasks))
+    application.add_handler(CommandHandler("matrix", show_matrix))
+    application.add_handler(CommandHandler("stats", show_stats))
+    application.add_handler(CommandHandler("complete", complete_task_command))
+    application.add_handler(CommandHandler("reminders", manage_reminders))
+    application.add_handler(CommandHandler("categories", show_categories))
+    
+    application.add_handler(CallbackQueryHandler(button_handler, pattern="^(category_|explain_categories|back_to_categories|complete_)"))
+    application.add_handler(CallbackQueryHandler(handle_deadline_selection, pattern="^deadline_"))
+    application.add_handler(CallbackQueryHandler(set_reminder_time, pattern="^reminder_"))
+    
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_task_text))
+    
+    scheduler = BackgroundScheduler()
+    scheduler.add_jobstore('sqlalchemy', url=f'sqlite:///{DB_PATH}_jobs')
+    
+    scheduler.add_job(
+        send_daily_reminder,
+        'cron',
+        hour=9,
+        minute=0,
+        args=[application],
+        id='daily_reminder'
+    )
+    
+    scheduler.start()
+    
+    print("Бот запущен...")
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
