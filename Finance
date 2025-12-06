@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""
+Финансовый планировщик для Telegram
+Упрощенная версия для быстрого запуска
+"""
+
+import os
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    CallbackQueryHandler,
+    ContextTypes
+)
+from dotenv import load_dotenv
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Загрузка переменных окружения
+load_dotenv()
+
+class SimpleFinanceBot:
+    def __init__(self):
+        self.token = os.getenv('TELEGRAM_BOT_TOKEN')
+        if not self.token:
+            raise ValueError("Токен бота не найден! Проверьте файл .env")
+        
+        # Простая база данных в памяти (для начала)
+        self.user_data = {}
+        self.categories = {
+            'food': '🍔 Еда',
+            'transport': '🚗 Транспорт',
+            'home': '🏠 Жилье',
+            'health': '💊 Здоровье',
+            'entertainment': '🎮 Развлечения',
+            'other': '📦 Другое'
+        }
+    
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /start"""
+        user = update.effective_user
+        
+        # Клавиатура главного меню
+        keyboard = [
+            [InlineKeyboardButton("➕ Добавить расход", callback_data="add_expense")],
+            [InlineKeyboardButton("📥 Добавить доход", callback_data="add_income")],
+            [InlineKeyboardButton("📊 Статистика", callback_data="show_stats")],
+            [InlineKeyboardButton("📋 Категории", callback_data="show_categories")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        welcome_text = f"""
+👋 Привет, {user.first_name}!
+
+💼 **Финансовый планировщик** готов к работе!
+
+📋 **Быстрый старт:**
+1. Нажмите "➕ Добавить расход"
+2. Выберите категорию
+3. Введите сумму
+
+💡 **Или используйте быстрый ввод:**
+Напишите `150 еда обед` или `доход 50000`
+        """
+        
+        await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+    
+    async def add_expense(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Добавление расхода"""
+        query = update.callback_query
+        await query.answer()
+        
+        # Создаем кнопки категорий
+        keyboard = []
+        for key, value in self.categories.items():
+            keyboard.append([InlineKeyboardButton(value, callback_data=f"category_{key}")])
+        
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "💳 **Выберите категорию расхода:**",
+            reply_markup=reply_markup
+        )
+    
+    async def handle_category(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка выбора категории"""
+        query = update.callback_query
+        category = query.data.split('_')[1]
+        
+        # Сохраняем категорию в контексте
+        context.user_data['category'] = category
+        category_name = self.categories.get(category, 'Другое')
+        
+        await query.edit_message_text(
+            f"📝 Выбрана категория: {category_name}\n\n"
+            "💵 **Введите сумму расхода:**\n"
+            "Пример: 1500"
+        )
+    
+    async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка текстовых сообщений"""
+        text = update.message.text
+        user_id = update.effective_user.id
+        
+        # Инициализируем хранилище для пользователя
+        if user_id not in self.user_data:
+            self.user_data[user_id] = {'expenses': [], 'income': []}
+        
+        # Быстрый парсинг команд
+        if text.isdigit():
+            # Пользователь ввел сумму
+            amount = float(text)
+            category = context.user_data.get('category', 'other')
+            
+            # Сохраняем расход
+            self.user_data[user_id]['expenses'].append({
+                'amount': amount,
+                'category': category,
+                'category_name': self.categories.get(category, 'Другое')
+            })
+            
+            await update.message.reply_text(
+                f"✅ Расход {amount} руб. добавлен в категорию "
+                f"{self.categories.get(category, 'Другое')}"
+            )
+            
+            # Показываем главное меню
+            await self.show_main_menu(update, context)
+            
+        elif text.lower().startswith('доход'):
+            # Обработка дохода
+            try:
+                amount = float(text.split()[1])
+                self.user_data[user_id]['income'].append({'amount': amount})
+                await update.message.reply_text(f"✅ Доход {amount} руб. добавлен")
+            except (IndexError, ValueError):
+                await update.message.reply_text("❌ Неверный формат. Пример: `доход 50000`")
+        
+        elif any(word in text.lower() for word in ['еда', 'транспорт', 'дом', 'здоровье', 'развлечения']):
+            # Пытаемся распарсить быстрый ввод
+            try:
+                parts = text.split()
+                amount = float(parts[0])
+                category = self.parse_category(text.lower())
+                
+                self.user_data[user_id]['expenses'].append({
+                    'amount': amount,
+                    'category': category,
+                    'category_name': self.categories.get(category, 'Другое')
+                })
+                
+                await update.message.reply_text(
+                    f"✅ Расход {amount} руб. добавлен!\n"
+                    f"Категория: {self.categories.get(category, 'Другое')}"
+                )
+            except (IndexError, ValueError):
+                await update.message.reply_text("❌ Неверный формат. Пример: `1500 еда обед`")
+    
+    def parse_category(self, text):
+        """Парсинг категории из текста"""
+        if 'еда' in text:
+            return 'food'
+        elif 'транспорт' in text:
+            return 'transport'
+        elif 'дом' in text or 'жилье' in text:
+            return 'home'
+        elif 'здоровье' in text:
+            return 'health'
+        elif 'развлечения' in text:
+            return 'entertainment'
+        else:
+            return 'other'
+    
+    async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать статистику"""
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        if user_id not in self.user_data or not self.user_data[user_id]['expenses']:
+            await query.edit_message_text("📊 Нет данных для отображения")
+            return
+        
+        expenses = self.user_data[user_id]['expenses']
+        total = sum(item['amount'] for item in expenses)
+        
+        # Группируем по категориям
+        stats = {}
+        for expense in expenses:
+            cat = expense['category_name']
+            stats[cat] = stats.get(cat, 0) + expense['amount']
+        
+        # Формируем отчет
+        report = "📊 **Ваша статистика:**\n\n"
+        report += f"💰 Всего расходов: {total} руб.\n\n"
+        
+        for category, amount in stats.items():
+            percentage = (amount / total) * 100
+            bars = "█" * int(percentage / 10)  # Один символ = 10%
+            report += f"{category}: {amount} руб. ({percentage:.1f}%)\n{bars}\n\n"
+        
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(report, reply_markup=reply_markup, parse_mode='Markdown')
+    
+    async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать главное меню"""
+        if hasattr(update, 'callback_query'):
+            query = update.callback_query
+            message = query.message
+        else:
+            message = update.message
+        
+        keyboard = [
+            [InlineKeyboardButton("➕ Добавить расход", callback_data="add_expense")],
+            [InlineKeyboardButton("📥 Добавить доход", callback_data="add_income")],
+            [InlineKeyboardButton("📊 Статистика", callback_data="show_stats")],
+            [InlineKeyboardButton("📋 Категории", callback_data="show_categories")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await message.reply_text(
+            "💼 **Главное меню**\n\n"
+            "Выберите действие:",
+            reply_markup=reply_markup
+        )
+    
+    async def show_categories(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать категории"""
+        query = update.callback_query
+        await query.answer()
+        
+        categories_text = "📋 **Доступные категории:**\n\n"
+        for key, value in self.categories.items():
+            categories_text += f"{value}\n"
+        
+        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(categories_text, reply_markup=reply_markup)
+    
+    def setup_handlers(self, application):
+        """Настройка обработчиков"""
+        # Команды
+        application.add_handler(CommandHandler("start", self.start))
+        
+        # Callback-кнопки
+        application.add_handler(CallbackQueryHandler(self.add_expense, pattern="^add_expense$"))
+        application.add_handler(CallbackQueryHandler(self.show_stats, pattern="^show_stats$"))
+        application.add_handler(CallbackQueryHandler(self.show_categories, pattern="^show_categories$"))
+        application.add_handler(CallbackQueryHandler(self.show_main_menu, pattern="^main_menu$"))
+        application.add_handler(CallbackQueryHandler(self.handle_category, pattern="^category_"))
+        
+        # Текстовые сообщения
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message))
+
+def main():
+    """Основная функция запуска бота"""
+    print("🚀 Запуск финансового бота...")
+    
+    try:
+        # Создаем экземпляр бота
+        bot = SimpleFinanceBot()
+        
+        # Создаем приложение
+        application = Application.builder().token(bot.token).build()
+        
+        # Настраиваем обработчики
+        bot.setup_handlers(application)
+        
+        print("✅ Бот успешно инициализирован!")
+        print(f"🤖 Токен: {bot.token[:10]}...")
+        print("\n📱 Теперь вы можете:")
+        print("1. Открыть Telegram")
+        print("2. Найти бота по username")
+        print("3. Отправить команду /start")
+        print("\n🔄 Бот запущен и ожидает сообщений...")
+        print("Для остановки нажмите Ctrl+C\n")
+        
+        # Запускаем бота
+        application.run_polling()
+        
+    except Exception as e:
+        print(f"❌ Ошибка при запуске бота: {e}")
+        print("\n🔧 Проверьте:")
+        print("1. Правильность токена в .env файле")
+        print("2. Наличие интернет-соединения")
+        print("3. Установленные зависимости (pip install python-telegram-bot python-dotenv)")
+
+if __name__ == "__main__":
+    main()
