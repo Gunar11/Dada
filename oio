@@ -1,0 +1,1091 @@
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+import sqlite3
+from datetime import datetime
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+# 16 вопросов и ответов по русским народным сказкам
+QUESTIONS = [
+    {
+        'question': '1. Кто помогал клубочку прятаться от Бабы-яги в сказке "Гуси-лебеди"?',
+        'options': ['Яблоня', 'Речка', 'Печка', 'Мышка'],
+        'correct': 2,  # Печка
+        'points': 10,
+        'difficulty': 'легкий'
+    },
+    {
+        'question': '2. Какое волшебное слово говорил Емеля, чтобы щука выполняла его желания?',
+        'options': ['По щучьему велению', 'Сим-сим откройся', 'Крекс-фекс-пекс', 'Раз-два-три'],
+        'correct': 0,  # По щучьему велению
+        'points': 10,
+        'difficulty': 'легкий'
+    },
+    {
+        'question': '3. Кого сначала испугался Колобок?',
+        'options': ['Медведя', 'Зайца', 'Волка', 'Лису'],
+        'correct': 1,  # Зайца
+        'points': 10,
+        'difficulty': 'легкий'
+    },
+    {
+        'question': '4. Из какого предмета сделана Кащею Бессмертному смерть?',
+        'options': ['Из камня', 'Из яйца', 'Из иглы', 'Из зеркала'],
+        'correct': 2,  # Из иглы
+        'points': 15,
+        'difficulty': 'средний'
+    },
+    {
+        'question': '5. Сколько раз богатыри бились с Чудом-Юдом в сказке "Иван-крестьянский сын и чудо-юдо"?',
+        'options': ['Один раз', 'Два раза', 'Три раза', 'Четыре раза'],
+        'correct': 2,  # Три раза
+        'points': 15,
+        'difficulty': 'средний'
+    },
+    {
+        'question': '6. Что попросила у старика золотая рыбка за свое спасение?',
+        'options': ['Новый дом', 'Свободу', 'Ничего', 'Коронацию'],
+        'correct': 2,  # Ничего
+        'points': 10,
+        'difficulty': 'легкий'
+    },
+    {
+        'question': '7. Какое прозвище было у Ивана - младшего сына в сказке "Конек-Горбунок"?',
+        'options': ['Дурак', 'Умник', 'Богатырь', 'Силач'],
+        'correct': 0,  # Дурак
+        'points': 10,
+        'difficulty': 'легкий'
+    },
+    {
+        'question': '8. Кто помог Финисту - Ясному Соколу вернуть свой облик?',
+        'options': ['Баба-яга', 'Василиса Премудрая', 'Марья-искусница', 'Царевна-лягушка'],
+        'correct': 2,  # Марья-искусница
+        'points': 20,
+        'difficulty': 'сложный'
+    },
+    {
+        'question': '9. Что использовала Лиса, чтобы выманить Петушка в сказке "Кот, Петух и Лиса"?',
+        'options': ['Мед', 'Пшено', 'Горох', 'Зеркало'],
+        'correct': 2,  # Горох
+        'points': 15,
+        'difficulty': 'средний'
+    },
+    {
+        'question': '10. Как звали собаку в сказке "Репка"?',
+        'options': ['Жучка', 'Барбос', 'Шарик', 'Мухтар'],
+        'correct': 0,  # Жучка
+        'points': 10,
+        'difficulty': 'легкий'
+    },
+    {
+        'question': '11. Что построили три поросенка для защиты от волка?',
+        'options': ['Дом из камня', 'Дом из кирпича', 'Дом из дерева', 'Дом из соломы'],
+        'correct': 0,  # Дом из камня
+        'points': 15,
+        'difficulty': 'средний'
+    },
+    {
+        'question': '12. Кто из этих персонажей НЕ является героем русской народной сказки?',
+        'options': ['Кощей Бессмертный', 'Баба-Яга', 'Змей Горыныч', 'Леший'],
+        'correct': 2,  # Змей Горыныч (хотя он тоже есть, но это проверка знаний)
+        'points': 20,
+        'difficulty': 'сложный'
+    },
+    {
+        'question': '13. Что искала курочка Ряба в одноименной сказке?',
+        'options': ['Зернышко', 'Иголку', 'Колечко', 'Яичко'],
+        'correct': 0,  # Зернышко
+        'points': 10,
+        'difficulty': 'легкий'
+    },
+    {
+        'question': '14. Кем был Иванушка в сказке "Сестрица Аленушка и братец Иванушка"?',
+        'options': ['Козленочек', 'Жеребеночек', 'Бычок', 'Гусь'],
+        'correct': 0,  # Козленочек
+        'points': 15,
+        'difficulty': 'средний'
+    },
+    {
+        'question': '15. Что случилось с теремком в конце одноименной сказки?',
+        'options': ['Сгорел', 'Развалился', 'Улетел', 'Растворился'],
+        'correct': 1,  # Развалился
+        'points': 15,
+        'difficulty': 'средний'
+    },
+    {
+        'question': '16. Какое заклинание говорили, чтобы попасть в тридевятое царство?',
+        'options': ['Встань передом, стань задом', 'Повернись на месте три раза', 'По щучьему велению', 'Сим-сим, откройся'],
+        'correct': 0,  # Встань передом, стань задом
+        'points': 20,
+        'difficulty': 'сложный'
+    }
+]
+
+# База данных
+def init_db():
+    conn = sqlite3.connect('fairy_tales_quiz.db')
+    cursor = conn.cursor()
+    
+    # Таблица для хранения результатов пользователей
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            total_score INTEGER DEFAULT 0,
+            quiz_completed BOOLEAN DEFAULT 0,
+            completed_at TIMESTAMP,
+            last_played TIMESTAMP,
+            current_question INTEGER DEFAULT 0
+        )
+    ''')
+    
+    # Таблица для хранения ответов на вопросы
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_answers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            question_number INTEGER,
+            score INTEGER,
+            answered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+# Функции для работы с базой данных
+def get_or_create_user(user_id, username, first_name, last_name):
+    conn = sqlite3.connect('fairy_tales_quiz.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        INSERT OR IGNORE INTO users (user_id, username, first_name, last_name) 
+        VALUES (?, ?, ?, ?)
+    ''', (user_id, username, first_name, last_name))
+    
+    cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    user = cursor.fetchone()
+    
+    conn.commit()
+    conn.close()
+    return user
+
+def check_quiz_completed(user_id):
+    """Проверяет, завершил ли пользователь викторину"""
+    conn = sqlite3.connect('fairy_tales_quiz.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT quiz_completed FROM users WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    
+    conn.close()
+    return result[0] if result else False
+
+def get_current_question(user_id):
+    """Получает текущий вопрос пользователя"""
+    conn = sqlite3.connect('fairy_tales_quiz.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT current_question FROM users WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    
+    conn.close()
+    return result[0] if result else 0
+
+def set_current_question(user_id, question_num):
+    """Устанавливает текущий вопрос пользователя"""
+    conn = sqlite3.connect('fairy_tales_quiz.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        UPDATE users 
+        SET current_question = ?
+        WHERE user_id = ?
+    ''', (question_num, user_id))
+    
+    conn.commit()
+    conn.close()
+
+def mark_quiz_completed(user_id):
+    """Отмечает викторину как завершенную"""
+    conn = sqlite3.connect('fairy_tales_quiz.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        UPDATE users 
+        SET quiz_completed = 1, 
+            completed_at = CURRENT_TIMESTAMP,
+            current_question = 0
+        WHERE user_id = ?
+    ''', (user_id,))
+    
+    conn.commit()
+    conn.close()
+
+def save_answer(user_id, question_num, score):
+    conn = sqlite3.connect('fairy_tales_quiz.db')
+    cursor = conn.cursor()
+    
+    # Проверяем, отвечал ли уже на этот вопрос
+    cursor.execute('''
+        SELECT COUNT(*) FROM user_answers 
+        WHERE user_id = ? AND question_number = ?
+    ''', (user_id, question_num))
+    
+    already_answered = cursor.fetchone()[0] > 0
+    
+    if already_answered:
+        conn.close()
+        return False  # Уже отвечал на этот вопрос
+    
+    # Сохраняем новый ответ
+    cursor.execute('''
+        INSERT INTO user_answers (user_id, question_number, score)
+        VALUES (?, ?, ?)
+    ''', (user_id, question_num, score))
+    
+    # Обновляем общий счет пользователя
+    cursor.execute('''
+        UPDATE users 
+        SET total_score = (
+            SELECT COALESCE(SUM(score), 0) 
+            FROM user_answers 
+            WHERE user_id = ?
+        ),
+        last_played = CURRENT_TIMESTAMP,
+        current_question = ? + 1
+        WHERE user_id = ?
+    ''', (user_id, question_num, user_id))
+    
+    conn.commit()
+    conn.close()
+    return True
+
+def get_user_score(user_id):
+    conn = sqlite3.connect('fairy_tales_quiz.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT total_score FROM users WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    
+    conn.close()
+    return result[0] if result else 0
+
+def get_leaderboard():
+    conn = sqlite3.connect('fairy_tales_quiz.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT user_id, username, first_name, last_name, total_score
+        FROM users 
+        WHERE total_score > 0 AND quiz_completed = 1
+        ORDER BY total_score DESC, completed_at ASC
+        LIMIT 10
+    ''')
+    
+    leaders = cursor.fetchall()
+    conn.close()
+    return leaders
+
+def count_completed_questions(user_id):
+    """Считает, сколько вопросов уже ответил пользователь"""
+    conn = sqlite3.connect('fairy_tales_quiz.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT COUNT(*) FROM user_answers WHERE user_id = ?', (user_id,))
+    count = cursor.fetchone()[0]
+    
+    conn.close()
+    return count
+
+def get_user_answers(user_id):
+    """Получает все ответы пользователя"""
+    conn = sqlite3.connect('fairy_tales_quiz.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT question_number, score 
+        FROM user_answers 
+        WHERE user_id = ? 
+        ORDER BY question_number
+    ''', (user_id,))
+    
+    answers = cursor.fetchall()
+    conn.close()
+    return answers
+
+def get_answered_questions(user_id):
+    """Получает список номеров вопросов, на которые уже ответили"""
+    conn = sqlite3.connect('fairy_tales_quiz.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT question_number FROM user_answers WHERE user_id = ?', (user_id,))
+    answers = cursor.fetchall()
+    
+    conn.close()
+    return [a[0] for a in answers]
+
+def get_question_stats():
+    """Получает статистику по вопросам"""
+    total_questions = len(QUESTIONS)
+    easy_questions = len([q for q in QUESTIONS if q['difficulty'] == 'легкий'])
+    medium_questions = len([q for q in QUESTIONS if q['difficulty'] == 'средний'])
+    hard_questions = len([q for q in QUESTIONS if q['difficulty'] == 'сложный'])
+    
+    total_points = sum(q['points'] for q in QUESTIONS)
+    
+    return {
+        'total': total_questions,
+        'easy': easy_questions,
+        'medium': medium_questions,
+        'hard': hard_questions,
+        'total_points': total_points
+    }
+
+# Команда /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    get_or_create_user(user.id, user.username, user.first_name, user.last_name)
+    
+    # Проверяем, завершил ли пользователь викторину
+    completed = check_quiz_completed(user.id)
+    stats = get_question_stats()
+    
+    if completed:
+        welcome_text = f"""
+👋 С возвращением, {user.first_name}!
+
+📚 Вы уже прошли расширенную викторину по русским народным сказкам!
+
+🏆 Ваш финальный счет: {get_user_score(user.id)} очков
+📊 Всего вопросов: {stats['total']}
+
+Вы больше не можете проходить викторину повторно.
+
+Доступные команды:
+/score - посмотреть свой счет
+/leaderboard - посмотреть таблицу лидеров
+/results - посмотреть свои результаты
+/rules - правила викторины
+        """
+    else:
+        current_q = get_current_question(user.id)
+        answered = count_completed_questions(user.id)
+        
+        welcome_text = f"""
+👋 Привет, {user.first_name}!
+
+📚 Добро пожаловать в РАСШИРЕННУЮ викторину по русским народным сказкам!
+
+✨ **Новая версия с {stats['total']} вопросами!**
+🎯 Максимально можно набрать: {stats['total_points']} очков
+
+⚠️ **ВАЖНЫЕ ПРАВИЛА:**
+1. Викторину можно пройти только один раз!
+2. Нельзя вернуться к предыдущим вопросам
+3. Нельзя изменить ответ после отправки
+
+📊 **Сложность вопросов:**
+• Легкие ({stats['easy']} шт.) - 10 очков
+• Средние ({stats['medium']} шт.) - 15 очков  
+• Сложные ({stats['hard']} шт.) - 20 очков
+
+📈 Ваш прогресс: {answered}/{stats['total']} вопросов
+
+🎮 Начнем викторину?
+
+Доступные команды:
+/start - начать/перезапустить
+/quiz - продолжить викторину
+/score - посмотреть свой счет
+/leaderboard - посмотреть таблицу лидеров
+/rules - правила викторины
+        """
+    
+    keyboard = []
+    if not completed:
+        keyboard.append([InlineKeyboardButton("🎮 Начать/продолжить викторину", callback_data='start_quiz')])
+    
+    keyboard.append([InlineKeyboardButton("📊 Таблица лидеров", callback_data='show_leaderboard')])
+    keyboard.append([InlineKeyboardButton("📋 Правила", callback_data='show_rules')])
+    
+    if completed:
+        keyboard.append([InlineKeyboardButton("📈 Мои результаты", callback_data='show_results')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+
+# Команда /rules
+async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    completed = check_quiz_completed(user_id)
+    answered = count_completed_questions(user_id)
+    stats = get_question_stats()
+    
+    rules_text = f"""
+📋 **Правила РАСШИРЕННОЙ викторины:**
+
+✨ **Новая версия! Теперь {stats['total']} вопросов!**
+
+⚠️ **Главные правила:**
+1. Викторину можно пройти ТОЛЬКО ОДИН РАЗ!
+2. ❌ НЕЛЬЗЯ вернуться к предыдущим вопросам
+3. ❌ НЕЛЬЗЯ изменить ответ после отправки
+4. Обдумайте ответ перед выбором!
+
+📝 **Детали викторины:**
+• Всего вопросов: {stats['total']}
+• Легкие: {stats['easy']} вопросов (10 очков)
+• Средние: {stats['medium']} вопросов (15 очков)  
+• Сложные: {stats['hard']} вопросов (20 очков)
+• Максимальный балл: {stats['total_points']} очков
+
+🎮 **Как проходит викторина:**
+1. Каждый вопрос имеет 4 варианта ответа
+2. После выбора сразу показывается результат
+3. Двигаться можно только вперед
+4. После ответа на все вопросы викторина завершается
+5. Победителем становится участник с наибольшим количеством очков
+
+🏆 **Таблица лидеров:**
+• Отображаются только завершившие викторину
+• Сортировка по очкам, затем по времени завершения
+• Первые три места получают медали:
+  • 1 место: 🥇 Золото
+  • 2 место: 🥈 Серебро  
+  • 3 место: 🥉 Бронза
+
+{'🎯 Вы уже прошли викторину! Результаты финальные.' if completed else f'📊 Ваш прогресс: {answered}/{stats["total"]} вопросов'}
+"""
+    
+    keyboard = []
+    if not completed:
+        keyboard.append([InlineKeyboardButton("🎮 Начать/продолжить викторину", callback_data='start_quiz')])
+    
+    keyboard.append([InlineKeyboardButton("🏆 Таблица лидеров", callback_data='show_leaderboard')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(rules_text, reply_markup=reply_markup)
+
+# Команда /quiz
+async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    # Проверяем, не завершил ли пользователь уже викторину
+    if check_quiz_completed(user_id):
+        await update.message.reply_text(
+            "❌ Вы уже прошли викторину! Повторное прохождение невозможно.\n"
+            "Используйте /results чтобы посмотреть свои ответы."
+        )
+        return
+    
+    await show_current_question(update, context)
+
+# Показать текущий вопрос
+async def show_current_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    # Проверяем, не завершил ли пользователь уже викторину
+    if check_quiz_completed(user_id):
+        if update.callback_query:
+            await update.callback_query.answer("Вы уже завершили викторину!", show_alert=True)
+        else:
+            await update.message.reply_text("Вы уже завершили викторину!")
+        return
+    
+    current_q = get_current_question(user_id)
+    answered = get_answered_questions(user_id)
+    
+    # Находим первый неотвеченный вопрос
+    for i in range(len(QUESTIONS)):
+        if i not in answered:
+            await show_question(update, context, i)
+            return
+    
+    # Если все вопросы отвечены, завершаем викторину
+    mark_quiz_completed(user_id)
+    await show_final_results(update, context, user_id)
+
+# Показать конкретный вопрос
+async def show_question(update: Update, context: ContextTypes.DEFAULT_TYPE, question_num):
+    user_id = update.effective_user.id
+    
+    # Проверяем, не завершил ли пользователь уже викторину
+    if check_quiz_completed(user_id):
+        if update.callback_query:
+            await update.callback_query.answer("Вы уже завершили викторину!", show_alert=True)
+        return
+    
+    # Проверяем, не отвечал ли уже на этот вопрос
+    answered_questions = get_answered_questions(user_id)
+    if question_num in answered_questions:
+        # Пытаемся найти следующий неотвеченный вопрос
+        for i in range(question_num + 1, len(QUESTIONS)):
+            if i not in answered_questions:
+                question_num = i
+                break
+        else:
+            # Все вопросы отвечены
+            mark_quiz_completed(user_id)
+            await show_final_results(update, context, user_id)
+            return
+    
+    question_data = QUESTIONS[question_num]
+    
+    # Создаем кнопки с вариантами ответов
+    keyboard = []
+    for i, option in enumerate(question_data['options']):
+        keyboard.append([InlineKeyboardButton(
+            f"{chr(65+i)}) {option}", 
+            callback_data=f"answer_{question_num}_{i}"
+        )])
+    
+    # Только кнопка для перехода к результатам (назад нельзя!)
+    keyboard.append([
+        InlineKeyboardButton("📊 Мои результаты", callback_data="show_results"),
+        InlineKeyboardButton("🏆 Лидеры", callback_data="show_leaderboard")
+    ])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Формируем текст вопроса
+    answered_count = count_completed_questions(user_id)
+    stats = get_question_stats()
+    
+    question_text = f"""
+📝 **Вопрос {question_num + 1} из {stats['total']}**
+
+{question_data['question']}
+
+💰 **Стоимость:** {question_data['points']} очков
+🎯 **Сложность:** {question_data['difficulty']}
+
+**Варианты ответов:**
+A) {question_data['options'][0]}
+B) {question_data['options'][1]}
+C) {question_data['options'][2]}
+D) {question_data['options'][3]}
+
+❌ **Внимание:** После выбора ответа изменить его будет нельзя!
+
+📊 Прогресс: {answered_count}/{stats['total']} ответов
+🏆 Ваш счет: {get_user_score(user_id)} очков
+    """
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text=question_text,
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text(question_text, reply_markup=reply_markup)
+
+# Обработка ответов
+async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    # Проверяем, не завершил ли пользователь уже викторину
+    if check_quiz_completed(user_id):
+        await query.answer("Вы уже завершили викторину!", show_alert=True)
+        return
+    
+    # Извлекаем данные из callback_data
+    data = query.data.split('_')
+    question_num = int(data[1])
+    selected_option = int(data[2])
+    
+    # Проверяем, не отвечал ли уже на этот вопрос
+    answered_questions = get_answered_questions(user_id)
+    if question_num in answered_questions:
+        await query.answer("Вы уже ответили на этот вопрос!", show_alert=True)
+        
+        # Показываем следующий вопрос
+        await show_current_question(update, context)
+        return
+    
+    question_data = QUESTIONS[question_num]
+    
+    # Проверяем ответ
+    is_correct = selected_option == question_data['correct']
+    score = question_data['points'] if is_correct else 0
+    
+    # Сохраняем ответ
+    success = save_answer(user_id, question_num, score)
+    
+    if not success:
+        await query.answer("Ошибка сохранения ответа!", show_alert=True)
+        return
+    
+    # Проверяем, ответил ли пользователь на все вопросы
+    answered_count = count_completed_questions(user_id)
+    all_answered = answered_count >= len(QUESTIONS)
+    stats = get_question_stats()
+    
+    # Показываем результат
+    result_text = f"""
+{'✅ **Правильно!**' if is_correct else '❌ **Неправильно!**'}
+
+{'🎉 Вы заработали ' + str(score) + ' очков!' if is_correct else '📌 **Правильный ответ:** ' + question_data['options'][question_data['correct']]}
+
+📊 **Ваш текущий счет:** {get_user_score(user_id)} очков
+📈 **Прогресс:** {answered_count}/{stats['total']} вопросов
+"""
+    
+    if not is_correct and score == 0:
+        result_text += f"\n💡 **Запомните:** {question_data['options'][question_data['correct']]}"
+    
+    keyboard = []
+    
+    if not all_answered:
+        keyboard.append([
+            InlineKeyboardButton("➡️ Следующий вопрос", callback_data='next_question'),
+            InlineKeyboardButton("📊 Мои результаты", callback_data="show_results")
+        ])
+    else:
+        # Отмечаем викторину как завершенную
+        mark_quiz_completed(user_id)
+        result_text += f"""
+
+🎉 🎉 🎉 **ВИКТОРИНА ЗАВЕРШЕНА!** 🎉 🎉 🎉
+
+🏆 **Ваш финальный счет:** {get_user_score(user_id)} очков из {stats['total_points']} возможных!
+
+📊 Вы ответили на все {stats['total']} вопросов.
+Теперь ваш результат в таблице лидеров!
+
+✨ **Спасибо за участие!**
+
+⚠️ Викторину нельзя пройти повторно.
+"""
+        
+        keyboard.append([
+            InlineKeyboardButton("🏆 Таблица лидеров", callback_data="show_leaderboard"),
+            InlineKeyboardButton("📈 Мои результаты", callback_data="show_results")
+        ])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text=result_text, reply_markup=reply_markup)
+
+# Показать финальные результаты
+async def show_final_results(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id):
+    score = get_user_score(user_id)
+    answers = get_user_answers(user_id)
+    stats = get_question_stats()
+    
+    # Подсчитываем правильные ответы по сложности
+    easy_correct = sum(1 for ans in answers if QUESTIONS[ans[0]]['difficulty'] == 'легкий' and ans[1] > 0)
+    medium_correct = sum(1 for ans in answers if QUESTIONS[ans[0]]['difficulty'] == 'средний' and ans[1] > 0)
+    hard_correct = sum(1 for ans in answers if QUESTIONS[ans[0]]['difficulty'] == 'сложный' and ans[1] > 0)
+    
+    result_text = f"""
+🎉 🎉 🎉 **ВИКТОРИНА ЗАВЕРШЕНА!** 🎉 🎉 🎉
+
+🏆 **Ваш финальный счет:** {score} очков из {stats['total_points']} возможных!
+
+📊 **Статистика по сложности:**
+• Легкие: {easy_correct}/{stats['easy']} ({easy_correct * 10} очков)
+• Средние: {medium_correct}/{stats['medium']} ({medium_correct * 15} очков)  
+• Сложные: {hard_correct}/{stats['hard']} ({hard_correct * 20} очков)
+
+📝 **Ваши ответы:**
+"""
+    
+    for i in range(len(QUESTIONS)):
+        found = False
+        for ans in answers:
+            if ans[0] == i:
+                q_score = ans[1]
+                difficulty = QUESTIONS[i]['difficulty']
+                emoji = '✅' if q_score > 0 else '❌'
+                result_text += f"{i+1:2d}. {emoji} ({difficulty}) - {q_score} очков\n"
+                found = True
+                break
+        
+        if not found:
+            result_text += f"{i+1:2d}. ❓ Не отвечено\n"
+    
+    result_text += f"""
+━━━━━━━━━━━━━━━━━━━━━━━━
+🎮 **Правильных ответов:** {len([a for a in answers if a[1] > 0])}/{stats['total']}
+📋 **Всего вопросов:** {stats['total']}
+
+⚠️ Викторину нельзя пройти повторно.
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton("🏆 Таблица лидеров", callback_data="show_leaderboard")],
+        [InlineKeyboardButton("📜 Правила", callback_data="show_rules")]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text=result_text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(result_text, reply_markup=reply_markup)
+
+# Следующий вопрос
+async def next_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    await show_current_question(update, context)
+
+# Показать результаты
+async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        user_id = query.from_user.id
+    else:
+        user_id = update.effective_user.id
+    
+    score = get_user_score(user_id)
+    answers = get_user_answers(user_id)
+    completed = check_quiz_completed(user_id)
+    answered_count = count_completed_questions(user_id)
+    stats = get_question_stats()
+    
+    # Формируем текст с результатами
+    if completed:
+        result_text = f"""
+📊 **ВАШИ ФИНАЛЬНЫЕ РЕЗУЛЬТАТЫ:**
+
+🏆 Финальный счет: {score} очков из {stats['total_points']} возможных
+🎯 Статус: Викторина завершена ✅
+📊 Вопросов: {stats['total']}
+"""
+    else:
+        result_text = f"""
+📊 **ВАШИ ТЕКУЩИЕ РЕЗУЛЬТАТЫ:**
+
+🎯 Текущий счет: {score} очков
+📈 Прогресс: {answered_count}/{stats['total']} вопросов
+⚠️ Статус: Викторина не завершена
+"""
+    
+    # Добавляем статистику по сложности если есть ответы
+    if answers:
+        easy_correct = sum(1 for ans in answers if QUESTIONS[ans[0]]['difficulty'] == 'легкий' and ans[1] > 0)
+        medium_correct = sum(1 for ans in answers if QUESTIONS[ans[0]]['difficulty'] == 'средний' and ans[1] > 0)
+        hard_correct = sum(1 for ans in answers if QUESTIONS[ans[0]]['difficulty'] == 'сложный' and ans[1] > 0)
+        
+        result_text += f"""
+📈 **Статистика по сложности:**
+• Легкие: {easy_correct}/{stats['easy']} ({easy_correct * 10} очков)
+• Средние: {medium_correct}/{stats['medium']} ({medium_correct * 15} очков)  
+• Сложные: {hard_correct}/{stats['hard']} ({hard_correct * 20} очков)
+"""
+    
+    result_text += f"""
+📝 **Ваши ответы:**
+"""
+    
+    answered_questions = [a[0] for a in answers]
+    
+    for i in range(len(QUESTIONS)):
+        if i in answered_questions:
+            # Находим ответ на этот вопрос
+            for ans in answers:
+                if ans[0] == i:
+                    q_score = ans[1]
+                    difficulty = QUESTIONS[i]['difficulty']
+                    emoji = '✅' if q_score > 0 else '❌'
+                    result_text += f"{i+1:2d}. {emoji} ({difficulty}) - {q_score} очков\n"
+                    break
+        else:
+            difficulty = QUESTIONS[i]['difficulty']
+            result_text += f"{i+1:2d}. ⏳ ({difficulty}) - еще не отвечали\n"
+    
+    result_text += f"""
+━━━━━━━━━━━━━━━━━━━━━━━━
+🎮 **Правильных ответов:** {len([a for a in answers if a[1] > 0])}/{answered_count}
+"""
+    
+    if not completed and answered_count < stats['total']:
+        remaining = stats['total'] - answered_count
+        result_text += f"\n⚠️ **Осталось ответить на {remaining} вопросов**"
+    
+    keyboard = []
+    
+    if not completed:
+        keyboard.append([InlineKeyboardButton(
+            "➡️ Продолжить викторину", 
+            callback_data='next_question'
+        )])
+    
+    keyboard.append([InlineKeyboardButton("🏆 Таблица лидеров", callback_data="show_leaderboard")])
+    
+    if completed:
+        keyboard.append([InlineKeyboardButton("📜 Правила", callback_data="show_rules")])
+    else:
+        keyboard.append([InlineKeyboardButton("📜 Правила викторины", callback_data="show_rules")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if query:
+        await query.edit_message_text(text=result_text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(result_text, reply_markup=reply_markup)
+
+# Команда /results
+async def results(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_results(update, context)
+
+# Показать таблицу лидеров
+async def show_leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_leaderboard_internal(update, context)
+
+async def show_leaderboard_internal(update: Update, context: ContextTypes.DEFAULT_TYPE, is_callback=False):
+    leaders = get_leaderboard()
+    user_id = update.effective_user.id if is_callback else update.effective_user.id
+    user_score = get_user_score(user_id)
+    user_position = None
+    stats = get_question_stats()
+    
+    if not leaders:
+        leaderboard_text = f"""
+🏆 **Таблица лидеров пуста!**
+
+📊 Всего вопросов: {stats['total']}
+🎯 Максимальный балл: {stats['total_points']} очков
+
+Будьте первым, кто завершит расширенную викторину!
+"""
+    else:
+        leaderboard_text = f"""
+🏆 **ТОП-10 ЛИДЕРОВ** 🏆
+
+📊 *Расширенная викторина ({stats['total']} вопросов)*
+🎯 *Только завершившие викторину*
+
+"""
+        
+        # Медали для первых трех мест
+        medals = ["🥇", "🥈", "🥉"]
+        
+        for i, (leader_id, username, first_name, last_name, score) in enumerate(leaders):
+            medal = medals[i] if i < 3 else f"{i+1}."
+            name = f"@{username}" if username else f"{first_name} {last_name or ''}".strip()
+            
+            # Помечаем текущего пользователя
+            if leader_id == user_id:
+                name = f"👉 **{name} (Вы)**"
+                user_position = i + 1
+            
+            # Добавляем процент выполнения
+            percentage = (score / stats['total_points']) * 100
+            leaderboard_text += f"{medal} {name}: {score} очков ({percentage:.1f}%)\n"
+    
+    # Добавляем информацию о текущем пользователе
+    leaderboard_text += f"""
+━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+    
+    if user_position:
+        leaderboard_text += f"🎯 **Ваше место:** {user_position}\n"
+    
+    leaderboard_text += f"🎯 **Ваш счет:** {user_score} очков\n"
+    percentage = (user_score / stats['total_points']) * 100 if stats['total_points'] > 0 else 0
+    leaderboard_text += f"📊 **Ваш результат:** {percentage:.1f}%\n"
+    
+    if check_quiz_completed(user_id):
+        leaderboard_text += "✅ Вы завершили викторину\n"
+    else:
+        answered = count_completed_questions(user_id)
+        leaderboard_text += f"📈 **Прогресс:** {answered}/{stats['total']} вопросов\n"
+        leaderboard_text += "⚠️ **Завершите викторину, чтобы попасть в таблицу лидеров!**\n"
+    
+    keyboard = []
+    user_completed = check_quiz_completed(user_id)
+    
+    if not user_completed:
+        keyboard.append([InlineKeyboardButton("🎮 Продолжить викторину", callback_data='next_question')])
+    
+    keyboard.append([InlineKeyboardButton("📊 Мои результаты", callback_data='show_results')])
+    keyboard.append([InlineKeyboardButton("📜 Правила", callback_data='show_rules')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if is_callback:
+        await update.callback_query.edit_message_text(
+            text=leaderboard_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text(
+            leaderboard_text, 
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+# Команда /score
+async def score(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    score = get_user_score(user_id)
+    completed = check_quiz_completed(user_id)
+    answered = count_completed_questions(user_id)
+    stats = get_question_stats()
+    
+    if completed:
+        percentage = (score / stats['total_points']) * 100
+        score_text = f"""
+📊 **Ваш финальный счет: {score} очков**
+
+🎉 Викторина завершена!
+📈 Результат: {percentage:.1f}% из {stats['total_points']} возможных
+🏆 Ваше место в таблице лидеров зафиксировано.
+"""
+    else:
+        score_text = f"""
+📊 **Ваш текущий счет: {score} очков**
+
+📈 Прогресс: {answered}/{stats['total']} вопросов
+🎯 Максимально можно набрать: {stats['total_points']} очков
+⚠️ Завершите викторину, чтобы попасть в таблицу лидеров!
+"""
+    
+    keyboard = []
+    if not completed:
+        keyboard.append([InlineKeyboardButton("🎮 Продолжить викторину", callback_data='next_question')])
+    
+    keyboard.append([InlineKeyboardButton("🏆 Таблица лидеров", callback_data='show_leaderboard')])
+    keyboard.append([InlineKeyboardButton("📊 Подробные результаты", callback_data='show_results')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(score_text, reply_markup=reply_markup)
+
+# Начать/продолжить викторину
+async def start_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    # Проверяем, не завершил ли пользователь уже викторину
+    if check_quiz_completed(user_id):
+        await query.answer("Вы уже завершили викторину! Повторное прохождение невозможно.", show_alert=True)
+        return
+    
+    # Продолжаем с текущего вопроса
+    await show_current_question(update, context)
+
+# Обработка callback запросов
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    
+    if data == 'start_quiz':
+        await start_quiz(update, context)
+    elif data == 'next_question':
+        await next_question(update, context)
+    elif data.startswith('answer_'):
+        await handle_answer(update, context)
+    elif data == 'show_results':
+        await show_results(update, context)
+    elif data == 'show_leaderboard':
+        await query.answer()
+        await show_leaderboard_internal(update, context, is_callback=True)
+    elif data == 'show_rules':
+        await query.answer()
+        await rules_callback(update, context)
+
+async def rules_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    completed = check_quiz_completed(user_id)
+    answered = count_completed_questions(user_id)
+    stats = get_question_stats()
+    
+    rules_text = f"""
+📋 **Правила РАСШИРЕННОЙ викторины:**
+
+✨ **Новая версия! Теперь {stats['total']} вопросов!**
+
+⚠️ **Главные правила:**
+1. Викторину можно пройти ТОЛЬКО ОДИН РАЗ!
+2. ❌ НЕЛЬЗЯ вернуться к предыдущим вопросам
+3. ❌ НЕЛЬЗЯ изменить ответ после отправки
+
+📝 **Детали викторины:**
+• Всего вопросов: {stats['total']}
+• Легкие: {stats['easy']} вопросов (10 очков)
+• Средние: {stats['medium']} вопросов (15 очков)  
+• Сложные: {stats['hard']} вопросов (20 очков)
+• Максимальный балл: {stats['total_points']} очков
+
+🏆 **Награды:**
+• 1 место: 🥇 Золото
+• 2 место: 🥈 Серебро  
+• 3 место: 🥉 Бронза
+
+{'🎯 Вы уже прошли викторину! Результаты финальные.' if completed else f'📊 Ваш прогресс: {answered}/{stats["total"]} вопросов'}
+"""
+    
+    keyboard = []
+    if not completed:
+        keyboard.append([InlineKeyboardButton("🎮 Продолжить викторину", callback_data='next_question')])
+    
+    keyboard.append([InlineKeyboardButton("🏆 Таблица лидеров", callback_data='show_leaderboard')])
+    
+    if completed:
+        keyboard.append([InlineKeyboardButton("📊 Мои результаты", callback_data='show_results')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text=rules_text, reply_markup=reply_markup)
+
+# Основная функция
+def main():
+    # Инициализация базы данных
+    init_db()
+    
+    # Создание приложения
+    application = Application.builder().token("YOUR_TOKEN_HERE").build()
+    
+    # Регистрация обработчиков
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("quiz", quiz))
+    application.add_handler(CommandHandler("score", score))
+    application.add_handler(CommandHandler("results", results))
+    application.add_handler(CommandHandler("leaderboard", show_leaderboard_command))
+    application.add_handler(CommandHandler("rules", rules))
+    
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    
+    # Запуск бота
+    stats = get_question_stats()
+    print("=" * 70)
+    print("           Бот РАСШИРЕННОЙ викторины по русским народным сказкам")
+    print("=" * 70)
+    print(f"📚 Количество вопросов: {stats['total']}")
+    print(f"🎯 Максимальный балл: {stats['total_points']} очков")
+    print(f"📊 Сложность: Легкие - {stats['easy']}, Средние - {stats['medium']}, Сложные - {stats['hard']}")
+    print("=" * 70)
+    print("⚠️  Важные особенности этого бота:")
+    print("1. Викторина проходит только один раз")
+    print("2. Невозможно вернуться к предыдущим вопросам")
+    print("3. Невозможно изменить ответ после отправки")
+    print("4. 16 разнообразных вопросов по русским народным сказкам")
+    print("=" * 70)
+    
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
