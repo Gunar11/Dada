@@ -1,0 +1,489 @@
+# main.py
+# Telegram bot (aiogram v3) for:
+# 1) voluntary donations via Telegram Stars (XTR)
+# 2) club application form (fio, birth year, workplace, desired role, about, help)
+# 3) admin review: approve/reject
+# 4) store applications + donations in SQLite
+#
+# How to run:
+#   pip install -U aiogram aiosqlite python-dotenv
+#   create .env (example below)
+#   python3 main.py
+
+import os
+import re
+import asyncio
+from datetime import datetime
+
+import aiosqlite
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    LabeledPrice,
+    PreCheckoutQuery,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+
+
+# -------------------- CONFIG --------------------
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # your Telegram user_id
+# Optional (only if you want to later invite to a club group/channel)
+CLUB_CHAT_ID = int(os.getenv("CLUB_CHAT_ID", "0"))
+# For Stars, provider_token is often an empty string.
+PROVIDER_TOKEN = os.getenv("PROVIDER_TOKEN", "").strip()
+
+DB_PATH = "club.db"
+
+DONATION_OPTIONS = [
+    ("Поддержать на 50 ⭐", 50, "donate_50"),
+    ("Поддержать на 200 ⭐", 200, "donate_200"),
+    ("Поддержать на 500 ⭐", 500, "donate_500"),
+]
+
+
+# -------------------- DB --------------------
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                fio TEXT NOT NULL,
+                birth_year INTEGER NOT NULL,
+                workplace TEXT NOT NULL,
+                desired_role TEXT NOT NULL,
+                about TEXT NOT NULL,
+                help TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS donations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                stars INTEGER NOT NULL,
+                payload TEXT,
+                telegram_charge_id TEXT,
+                provider_charge_id TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.commit()
+
+
+async def save_application(data: dict, user_id: int, username: str | None) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT INTO applications
+            (user_id, username, fio, birth_year, workplace, desired_role, about, help, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                user_id,
+                username,
+                data["fio"],
+                int(data["birth_year"]),
+                data["workplace"],
+                data["desired_role"],
+                data["about"],
+                data["help"],
+                datetime.utcnow().isoformat(timespec="seconds"),
+            ),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def set_application_status(app_id: int, status: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE applications SET status=? WHERE id=?", (status, app_id))
+        await db.commit()
+
+
+async def get_application(app_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT id,user_id,username,fio,birth_year,workplace,desired_role,about,help,status,created_at
+            FROM applications
+            WHERE id=?
+            """,
+            (app_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        keys = [
+            "id",
+            "user_id",
+            "username",
+            "fio",
+            "birth_year",
+            "workplace",
+            "desired_role",
+            "about",
+            "help",
+            "status",
+            "created_at",
+        ]
+        return dict(zip(keys, row))
+
+
+async def save_donation(message: Message):
+    sp = message.successful_payment
+    stars = int(sp.total_amount)  # For XTR: total_amount == number of stars
+    payload = sp.invoice_payload
+    user_id = message.from_user.id
+    username = message.from_user.username
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO donations
+            (user_id, username, stars, payload, telegram_charge_id, provider_charge_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                username,
+                stars,
+                payload,
+                sp.telegram_payment_charge_id,
+                sp.provider_payment_charge_id,
+                datetime.utcnow().isoformat(timespec="seconds"),
+            ),
+        )
+        await db.commit()
+
+
+async def get_total_donations_stars(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COALESCE(SUM(stars), 0) FROM donations WHERE user_id=?",
+            (user_id,),
+        )
+        (total,) = await cur.fetchone()
+        return int(total)
+
+
+async def get_global_donation_stats() -> tuple[int, int]:
+    """
+    returns: (total_stars, unique_donors)
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur1 = await db.execute("SELECT COALESCE(SUM(stars), 0) FROM donations")
+        (total_stars,) = await cur1.fetchone()
+
+        cur2 = await db.execute("SELECT COUNT(DISTINCT user_id) FROM donations")
+        (unique_donors,) = await cur2.fetchone()
+
+        return int(total_stars), int(unique_donors)
+
+
+# -------------------- FSM --------------------
+class ApplyForm(StatesGroup):
+    fio = State()
+    birth_year = State()
+    workplace = State()
+    desired_role = State()
+    about = State()
+    help = State()
+
+
+# -------------------- HELPERS --------------------
+def sanitize_year(text: str) -> int | None:
+    m = re.search(r"\b(19\d{2}|20\d{2})\b", text.strip())
+    if not m:
+        return None
+    year = int(m.group(1))
+    now_year = datetime.utcnow().year
+    if 1900 <= year <= now_year:
+        return year
+    return None
+
+
+def kb_main():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💫 Донат Stars (добровольно)", callback_data="donate_menu")
+    kb.button(text="📝 Подать заявку в клуб", callback_data="apply_start")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def kb_donate_menu():
+    kb = InlineKeyboardBuilder()
+    for title, stars, payload in DONATION_OPTIONS:
+        kb.button(text=title, callback_data=f"donate:{stars}:{payload}")
+    kb.button(text="⬅️ Назад", callback_data="back_main")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def kb_admin_decision(app_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Одобрить", callback_data=f"app_approve:{app_id}")
+    kb.button(text="❌ Отклонить", callback_data=f"app_reject:{app_id}")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+# -------------------- MAIN --------------------
+async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN пустой. Заполни .env")
+
+    await init_db()
+
+    bot = Bot(BOT_TOKEN)
+    dp = Dispatcher()
+
+    # --------- START / MENU ----------
+    @dp.message(CommandStart())
+    async def start(message: Message):
+        await message.answer(
+            "Привет! Это бот клуба.\n\n"
+            "• Донат Stars — добровольный взнос на поддержку.\n"
+            "• Заявка в клуб — анкета на рассмотрение.\n",
+            reply_markup=kb_main(),
+        )
+
+    @dp.message(Command("menu"))
+    async def menu_cmd(message: Message):
+        await message.answer("Меню:", reply_markup=kb_main())
+
+    @dp.callback_query(F.data == "back_main")
+    async def back_main(cb: CallbackQuery):
+        await cb.message.edit_text("Меню:", reply_markup=kb_main())
+        await cb.answer()
+
+    # --------- DONATE ----------
+    @dp.callback_query(F.data == "donate_menu")
+    async def donate_menu(cb: CallbackQuery):
+        await cb.message.edit_text("Выбери сумму добровольного взноса ⭐:", reply_markup=kb_donate_menu())
+        await cb.answer()
+
+    @dp.callback_query(F.data.startswith("donate:"))
+    async def donate_create_invoice(cb: CallbackQuery):
+        # donate:<stars>:<payload>
+        _, stars_str, payload = cb.data.split(":", 2)
+        stars = int(stars_str)
+
+        prices = [LabeledPrice(label=f"Добровольный взнос {stars} ⭐", amount=stars)]
+        await cb.message.answer_invoice(
+            title="Добровольный взнос ⭐",
+            description=f"Поддержка организации на {stars} Telegram Stars",
+            payload=payload,
+            provider_token=PROVIDER_TOKEN,  # Stars often allow ""
+            currency="XTR",
+            prices=prices,
+        )
+        await cb.answer()
+
+    @dp.pre_checkout_query()
+    async def pre_checkout(pre: PreCheckoutQuery, bot: Bot):
+        await bot.answer_pre_checkout_query(pre.id, ok=True)
+
+    @dp.message(F.successful_payment)
+    async def successful_payment(message: Message):
+        await save_donation(message)
+        stars = int(message.successful_payment.total_amount)
+        await message.answer(
+            f"Спасибо! Добровольный взнос принят: {stars} ⭐\n"
+            "Если хочешь — подай заявку в клуб через меню.",
+            reply_markup=kb_main(),
+        )
+
+    # User can check their donated total (internal stats)
+    @dp.message(Command("my_donations"))
+    async def my_donations(message: Message):
+        total = await get_total_donations_stars(message.from_user.id)
+        await message.answer(f"Твои донаты через этого бота: {total} ⭐ (по учёту бота).")
+
+    # Admin global stats
+    @dp.message(Command("stats"))
+    async def stats(message: Message):
+        if message.from_user.id != ADMIN_ID:
+            await message.answer("Недостаточно прав.")
+            return
+        total_stars, unique_donors = await get_global_donation_stats()
+        await message.answer(
+            "📊 Статистика донатов (учёт бота)\n"
+            f"Всего собрано: {total_stars} ⭐\n"
+            f"Донатеров: {unique_donors}"
+        )
+
+    # --------- APPLY FORM ----------
+    @dp.callback_query(F.data == "apply_start")
+    async def apply_start(cb: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await state.set_state(ApplyForm.fio)
+        await cb.message.answer("📝 Заявка в клуб.\n\nШаг 1/6: Введи ФИО (полностью).")
+        await cb.answer()
+
+    @dp.message(ApplyForm.fio)
+    async def apply_fio(message: Message, state: FSMContext):
+        fio = message.text.strip()
+        if len(fio) < 5:
+            await message.answer("ФИО слишком короткое. Введи полностью.")
+            return
+        await state.update_data(fio=fio)
+        await state.set_state(ApplyForm.birth_year)
+        await message.answer("Шаг 2/6: Год рождения (например, 1999).")
+
+    @dp.message(ApplyForm.birth_year)
+    async def apply_birth_year(message: Message, state: FSMContext):
+        year = sanitize_year(message.text)
+        if year is None:
+            await message.answer("Не понял год. Напиши 4 цифры (например, 1999).")
+            return
+        await state.update_data(birth_year=str(year))
+        await state.set_state(ApplyForm.workplace)
+        await message.answer("Шаг 3/6: Место работы (компания/сфера/должность).")
+
+    @dp.message(ApplyForm.workplace)
+    async def apply_workplace(message: Message, state: FSMContext):
+        t = message.text.strip()
+        if len(t) < 2:
+            await message.answer("Напиши место работы чуть подробнее.")
+            return
+        await state.update_data(workplace=t)
+        await state.set_state(ApplyForm.desired_role)
+        await message.answer("Шаг 4/6: Желаемая должность/роль в клубе.")
+
+    @dp.message(ApplyForm.desired_role)
+    async def apply_role(message: Message, state: FSMContext):
+        t = message.text.strip()
+        if len(t) < 2:
+            await message.answer("Напиши желаемую роль подробнее.")
+            return
+        await state.update_data(desired_role=t)
+        await state.set_state(ApplyForm.about)
+        await message.answer(
+            "Шаг 5/6: Какая информация о тебе важна для рассмотрения заявки?\n"
+            "(Опыт, навыки, достижения — свободным текстом)"
+        )
+
+    @dp.message(ApplyForm.about)
+    async def apply_about(message: Message, state: FSMContext):
+        t = message.text.strip()
+        if len(t) < 10:
+            await message.answer("Слишком коротко. Напиши 2–3 предложения.")
+            return
+        await state.update_data(about=t)
+        await state.set_state(ApplyForm.help)
+        await message.answer(
+            "Шаг 6/6: Чем ты можешь помочь в нашей сфере?\n"
+            "(Связи, экспертиза, контент, аналитика, организация и т.д.)"
+        )
+
+    @dp.message(ApplyForm.help)
+    async def apply_help(message: Message, state: FSMContext, bot: Bot):
+        t = message.text.strip()
+        if len(t) < 5:
+            await message.answer("Напиши чуть подробнее, чем можешь помочь.")
+            return
+
+        await state.update_data(help=t)
+        data = await state.get_data()
+        await state.clear()
+
+        user_id = message.from_user.id
+        username = message.from_user.username
+
+        app_id = await save_application(data, user_id, username)
+
+        # user ack
+        await message.answer(
+            f"✅ Заявка принята и отправлена на рассмотрение. ID заявки: {app_id}",
+            reply_markup=kb_main(),
+        )
+
+        # admin notice
+        total_stars = await get_total_donations_stars(user_id)
+        username_str = f"@{username}" if username else "(нет username)"
+
+        text = (
+            "🧾 Новая заявка в клуб\n\n"
+            f"ID: {app_id}\n"
+            f"От: {message.from_user.full_name} {username_str}\n"
+            f"user_id: {user_id}\n"
+            f"Всего донатов: {total_stars} ⭐ (добровольно)\n\n"
+            f"ФИО: {data['fio']}\n"
+            f"Год рождения: {data['birth_year']}\n"
+            f"Место работы: {data['workplace']}\n"
+            f"Желаемая роль: {data['desired_role']}\n\n"
+            f"Информация о себе:\n{data['about']}\n\n"
+            f"Чем может помочь:\n{data['help']}\n"
+        )
+
+        await bot.send_message(ADMIN_ID, text, reply_markup=kb_admin_decision(app_id))
+
+    # --------- ADMIN ACTIONS ----------
+    @dp.callback_query(F.data.startswith("app_approve:"))
+    async def app_approve(cb: CallbackQuery, bot: Bot):
+        if cb.from_user.id != ADMIN_ID:
+            await cb.answer("Недостаточно прав.", show_alert=True)
+            return
+
+        app_id = int(cb.data.split(":")[1])
+        app = await get_application(app_id)
+        if not app:
+            await cb.answer("Заявка не найдена.", show_alert=True)
+            return
+
+        await set_application_status(app_id, "approved")
+
+        # update admin message
+        await cb.message.edit_text(cb.message.text + "\n\n✅ Статус: ОДОБРЕНО")
+        await cb.answer("Одобрено.")
+
+        # notify user
+        try:
+            await bot.send_message(app["user_id"], "✅ Ваша заявка одобрена.")
+        except Exception:
+            pass
+
+    @dp.callback_query(F.data.startswith("app_reject:"))
+    async def app_reject(cb: CallbackQuery, bot: Bot):
+        if cb.from_user.id != ADMIN_ID:
+            await cb.answer("Недостаточно прав.", show_alert=True)
+            return
+
+        app_id = int(cb.data.split(":")[1])
+        app = await get_application(app_id)
+        if not app:
+            await cb.answer("Заявка не найдена.", show_alert=True)
+            return
+
+        await set_application_status(app_id, "rejected")
+
+        await cb.message.edit_text(cb.message.text + "\n\n❌ Статус: ОТКЛОНЕНО")
+        await cb.answer("Отклонено.")
+
+        try:
+            await bot.send_message(app["user_id"], "❌ Ваша заявка отклонена.")
+        except Exception:
+            pass
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
